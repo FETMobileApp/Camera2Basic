@@ -18,6 +18,7 @@ package com.example.android.camera2basic;
 
 import android.os.Bundle;
 import android.support.v7.app.AppCompatActivity;
+import android.view.WindowManager;
 
 public class CameraActivity extends AppCompatActivity {
 
@@ -30,6 +31,7 @@ public class CameraActivity extends AppCompatActivity {
                     .replace(R.id.container, Camera2BasicFragment.newInstance())
                     .commit();
         }
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
     }
 
 }

@@ -42,6 +42,7 @@ import android.hardware.camera2.params.StreamConfigurationMap;
 import android.media.Image;
 import android.media.ImageReader;
 import android.os.Bundle;
+import android.os.Environment;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.support.annotation.NonNull;
@@ -62,14 +63,31 @@ import android.widget.Toast;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.UnsupportedEncodingException;
+import java.net.URL;
+import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.Date;
 import java.util.List;
+import java.util.Locale;
+import java.util.UUID;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
+
+import javax.net.ssl.HttpsURLConnection;
+
+import okhttp3.MediaType;
+import okhttp3.MultipartBody;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.RequestBody;
+import okhttp3.Response;
+
 
 public class Camera2BasicFragment extends Fragment
         implements View.OnClickListener, ActivityCompat.OnRequestPermissionsResultCallback {
@@ -79,7 +97,11 @@ public class Camera2BasicFragment extends Fragment
      */
     private static final SparseIntArray ORIENTATIONS = new SparseIntArray();
     private static final int REQUEST_CAMERA_PERMISSION = 1;
+    private static final int REQUEST_WRITE_STORAGE_PERMISSION = 2;
+    private static final int REQUEST_READ_STORAGE_PERMISSION = 3;
     private static final String FRAGMENT_DIALOG = "dialog";
+
+    private static final String serverURL = "http://airg19-api2.southeastasia.cloudapp.azure.com/api/upload-img";
 
     static {
         ORIENTATIONS.append(Surface.ROTATION_0, 90);
@@ -233,6 +255,7 @@ public class Camera2BasicFragment extends Fragment
      * This is the output file for our picture.
      */
     private File mFile;
+    private String mFilename;
 
     /**
      * This a callback object for the {@link ImageReader}. "onImageAvailable" will be called when a
@@ -382,7 +405,7 @@ public class Camera2BasicFragment extends Fragment
      * @return The optimal {@code Size}, or an arbitrary one if none were big enough
      */
     private static Size chooseOptimalSize(Size[] choices, int textureViewWidth,
-            int textureViewHeight, int maxWidth, int maxHeight, Size aspectRatio) {
+                                          int textureViewHeight, int maxWidth, int maxHeight, Size aspectRatio) {
 
         // Collect the supported resolutions that are at least as big as the preview Surface
         List<Size> bigEnough = new ArrayList<>();
@@ -394,7 +417,7 @@ public class Camera2BasicFragment extends Fragment
             if (option.getWidth() <= maxWidth && option.getHeight() <= maxHeight &&
                     option.getHeight() == option.getWidth() * h / w) {
                 if (option.getWidth() >= textureViewWidth &&
-                    option.getHeight() >= textureViewHeight) {
+                        option.getHeight() >= textureViewHeight) {
                     bigEnough.add(option);
                 } else {
                     notBigEnough.add(option);
@@ -431,16 +454,28 @@ public class Camera2BasicFragment extends Fragment
         mTextureView = (AutoFitTextureView) view.findViewById(R.id.texture);
     }
 
-    @Override
-    public void onActivityCreated(Bundle savedInstanceState) {
-        super.onActivityCreated(savedInstanceState);
-        mFile = new File(getActivity().getExternalFilesDir(null), "pic.jpg");
+    void setCaptureFileName() {
+        String timeStamp = new SimpleDateFormat("yyyyMMddHHmmss", Locale.US).format(new Date());
+        mFilename = "DCIM" + timeStamp + ".jpg";
+        mFile = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM), mFilename);
     }
+
+    static final int CAPTURE_PERIOD = 10 * 1000; // 2 seconds
 
     @Override
     public void onResume() {
         super.onResume();
         startBackgroundThread();
+
+        if (ContextCompat.checkSelfPermission(getActivity(), Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                != PackageManager.PERMISSION_GRANTED) {
+            requestWriteStoragePermission();
+        }
+
+        if (ContextCompat.checkSelfPermission(getActivity(), Manifest.permission.READ_EXTERNAL_STORAGE)
+                != PackageManager.PERMISSION_GRANTED) {
+            requestReadStoragePermission();
+        }
 
         // When the screen is turned off and turned back on, the SurfaceTexture is already
         // available, and "onSurfaceTextureAvailable" will not be called. In that case, we can open
@@ -451,6 +486,8 @@ public class Camera2BasicFragment extends Fragment
         } else {
             mTextureView.setSurfaceTextureListener(mSurfaceTextureListener);
         }
+
+        mBackgroundHandler.postDelayed(new ImageCapture(this), CAPTURE_PERIOD);
     }
 
     @Override
@@ -462,9 +499,25 @@ public class Camera2BasicFragment extends Fragment
 
     private void requestCameraPermission() {
         if (shouldShowRequestPermissionRationale(Manifest.permission.CAMERA)) {
-            new ConfirmationDialog().show(getChildFragmentManager(), FRAGMENT_DIALOG);
+            new CameraConfirmationDialog().show(getChildFragmentManager(), FRAGMENT_DIALOG);
         } else {
             requestPermissions(new String[]{Manifest.permission.CAMERA}, REQUEST_CAMERA_PERMISSION);
+        }
+    }
+
+    private void requestWriteStoragePermission() {
+        if (shouldShowRequestPermissionRationale(Manifest.permission.WRITE_EXTERNAL_STORAGE)) {
+            new WriteStorageConfirmationDialog().show(getChildFragmentManager(), FRAGMENT_DIALOG);
+        } else {
+            requestPermissions(new String[]{Manifest.permission.WRITE_EXTERNAL_STORAGE}, REQUEST_WRITE_STORAGE_PERMISSION);
+        }
+    }
+
+    private void requestReadStoragePermission() {
+        if (shouldShowRequestPermissionRationale(Manifest.permission.READ_EXTERNAL_STORAGE)) {
+            new ReadStorageConfirmationDialog().show(getChildFragmentManager(), FRAGMENT_DIALOG);
+        } else {
+            requestPermissions(new String[]{Manifest.permission.READ_EXTERNAL_STORAGE}, REQUEST_READ_STORAGE_PERMISSION);
         }
     }
 
@@ -473,7 +526,17 @@ public class Camera2BasicFragment extends Fragment
                                            @NonNull int[] grantResults) {
         if (requestCode == REQUEST_CAMERA_PERMISSION) {
             if (grantResults.length != 1 || grantResults[0] != PackageManager.PERMISSION_GRANTED) {
-                ErrorDialog.newInstance(getString(R.string.request_permission))
+                ErrorDialog.newInstance(getString(R.string.request_camera_permission))
+                        .show(getChildFragmentManager(), FRAGMENT_DIALOG);
+            }
+        } else if (requestCode == REQUEST_WRITE_STORAGE_PERMISSION) {
+            if (grantResults.length != 1 || grantResults[0] != PackageManager.PERMISSION_GRANTED) {
+                ErrorDialog.newInstance(getString(R.string.request_storage_permission))
+                        .show(getChildFragmentManager(), FRAGMENT_DIALOG);
+            }
+        } else if (requestCode == REQUEST_READ_STORAGE_PERMISSION) {
+            if (grantResults.length != 1 || grantResults[0] != PackageManager.PERMISSION_GRANTED) {
+                ErrorDialog.newInstance(getString(R.string.request_storage_permission))
                         .show(getChildFragmentManager(), FRAGMENT_DIALOG);
             }
         } else {
@@ -509,9 +572,23 @@ public class Camera2BasicFragment extends Fragment
                 }
 
                 // For still image captures, we use the largest available size.
+//                int maxWidth = 1920, maxHeight = 1080;
+//                List<Size> outputSizeList = Arrays.asList(map.getOutputSizes(ImageFormat.JPEG));
+//                Size largest = outputSizeList.get(0);
+//                for (int i = outputSizeList.size() - 1; i >= 0; i--) {
+//                    Size size = outputSizeList.get(i);
+//                    if (size.getWidth() >= maxWidth || size.getHeight() >= maxHeight) {
+//                        largest = size;
+//                        break;
+//                    }
+//                }
+
                 Size largest = Collections.max(
                         Arrays.asList(map.getOutputSizes(ImageFormat.JPEG)),
                         new CompareSizesByArea());
+
+                Log.d(TAG, "Resolution to save: " + largest.getWidth() + "x" + largest.getHeight());
+
                 mImageReader = ImageReader.newInstance(largest.getWidth(), largest.getHeight(),
                         ImageFormat.JPEG, /*maxImages*/2);
                 mImageReader.setOnImageAvailableListener(
@@ -766,6 +843,7 @@ public class Camera2BasicFragment extends Fragment
      * Initiate a still image capture.
      */
     private void takePicture() {
+        setCaptureFileName();
         lockFocus();
     }
 
@@ -838,6 +916,7 @@ public class Camera2BasicFragment extends Fragment
                     showToast("Saved: " + mFile);
                     Log.d(TAG, mFile.toString());
                     unlockFocus();
+                    mBackgroundHandler.post(new ImageUploader(mFile, mFilename, serverURL, mUploadListener));
                 }
             };
 
@@ -911,6 +990,20 @@ public class Camera2BasicFragment extends Fragment
         }
     }
 
+    private static class ImageCapture implements Runnable {
+
+        Camera2BasicFragment mFragment;
+
+        ImageCapture(Camera2BasicFragment fragment) {
+            mFragment = fragment;
+        }
+
+        @Override
+        public void run() {
+            mFragment.takePicture();
+        }
+    }
+
     /**
      * Saves a JPEG {@link Image} into the specified {@link File}.
      */
@@ -953,6 +1046,110 @@ public class Camera2BasicFragment extends Fragment
             }
         }
 
+    }
+
+    public static class ImageUploadListener {
+        Camera2BasicFragment mFragment;
+
+        public ImageUploadListener(Camera2BasicFragment fragment) {
+            mFragment = fragment;
+        }
+
+        public void onImageUploadStart(String message) {
+            mFragment.showToast(message);
+        }
+
+        public void onImageUploadFinished(String message) {
+            mFragment.showToast(message);
+            mFragment.mBackgroundHandler.postDelayed(new ImageCapture(mFragment), CAPTURE_PERIOD);
+        }
+    }
+
+    ImageUploadListener mUploadListener = new ImageUploadListener(this);
+
+    /**
+     * Upload saved JPEG {@link File} to the specified server location.
+     */
+    private static class ImageUploader implements Runnable {
+
+        private final String BOUNDARY = UUID.randomUUID().toString();
+        private final String REQUEST_METHOD = "POST";
+        private final String CONTENT_TYPE = "Content-Type";
+        private final String CONTENT_DISPOSITION = "Content-Disposition";
+        private final String DATA_TYPE = "form-data;";
+        private final String APPLICATION_TYPE = "multipart/" + DATA_TYPE + "boundary=" + BOUNDARY;
+        private final String KEY_IMAGE = "img";
+
+        private final int METHOD_HTTP_CONNECTION = 1;
+        private final int METHOD_OKHTTP = 2;
+
+        /**
+         * The JPEG file
+         */
+        private final File mFile;
+        private final String mFilename;
+
+        /**
+         * The server location we upload the image to.
+         */
+        private final String mServerURL;
+
+        private ImageUploadListener mListener;
+
+        private URL mURL;
+        private HttpsURLConnection mURLConnection;
+        //        private HttpURLConnection mURLConnection;
+
+        ImageUploader(File file, String fileName, String url, ImageUploadListener listener) {
+            this.mFile = file;
+            this.mFilename = fileName;
+            this.mServerURL = url;
+            this.mListener = listener;
+        }
+
+        @Override
+        public void run() {
+            if (mServerURL.isEmpty() || !mFile.exists())
+                return;
+
+            String message = "File: " + mFile.toString();
+            if (mListener != null)
+                mListener.onImageUploadStart("Uploading " + message + " to " + mServerURL);
+            Log.d(TAG, "Uploading " + message + " to " + mServerURL);
+
+            try {
+                final MediaType MEDIA_TYPE_JPEG = MediaType.parse("image/jpeg");
+                RequestBody body = new MultipartBody.Builder()
+                        .setType(MultipartBody.FORM)
+                        .addFormDataPart(KEY_IMAGE, mFilename, RequestBody.create(MEDIA_TYPE_JPEG, mFile))
+                        .build();
+
+                Request request = new Request.Builder()
+                        .url(mServerURL)
+                        .post(body)
+                        .build();
+
+                OkHttpClient client = new OkHttpClient();
+                Response response = client.newCall(request).execute();
+
+                Log.d(TAG, response.body().toString());
+                if (response.isSuccessful())
+                    message += " uploaded successfully!";
+                else
+                    message += " failed to upload: " + response.message();
+            } catch (UnknownHostException | UnsupportedEncodingException e) {
+                message = "Error: " + e.getLocalizedMessage();
+                Log.e(TAG, message);
+            } catch (Exception e) {
+                message = "Exception: " + e.getMessage();
+                Log.d(TAG, message);
+            } finally {
+
+            }
+
+            if (mListener != null)
+                mListener.onImageUploadFinished(message);
+        }
     }
 
     /**
@@ -1004,14 +1201,14 @@ public class Camera2BasicFragment extends Fragment
     /**
      * Shows OK/Cancel confirmation dialog about camera permission.
      */
-    public static class ConfirmationDialog extends DialogFragment {
+    public static class CameraConfirmationDialog extends DialogFragment {
 
         @NonNull
         @Override
         public Dialog onCreateDialog(Bundle savedInstanceState) {
             final Fragment parent = getParentFragment();
             return new AlertDialog.Builder(getActivity())
-                    .setMessage(R.string.request_permission)
+                    .setMessage(R.string.request_camera_permission)
                     .setPositiveButton(android.R.string.ok, new DialogInterface.OnClickListener() {
                         @Override
                         public void onClick(DialogInterface dialog, int which) {
@@ -1033,4 +1230,67 @@ public class Camera2BasicFragment extends Fragment
         }
     }
 
+    /**
+     * Shows OK/Cancel confirmation dialog about storage permission.
+     */
+    public static class WriteStorageConfirmationDialog extends DialogFragment {
+
+        @NonNull
+        @Override
+        public Dialog onCreateDialog(Bundle savedInstanceState) {
+            final Fragment parent = getParentFragment();
+            return new AlertDialog.Builder(getActivity())
+                    .setMessage(R.string.request_storage_permission)
+                    .setPositiveButton(android.R.string.ok, new DialogInterface.OnClickListener() {
+                        @Override
+                        public void onClick(DialogInterface dialog, int which) {
+                            parent.requestPermissions(new String[]{Manifest.permission.WRITE_EXTERNAL_STORAGE},
+                                    REQUEST_WRITE_STORAGE_PERMISSION);
+                        }
+                    })
+                    .setNegativeButton(android.R.string.cancel,
+                            new DialogInterface.OnClickListener() {
+                                @Override
+                                public void onClick(DialogInterface dialog, int which) {
+                                    Activity activity = parent.getActivity();
+                                    if (activity != null) {
+                                        activity.finish();
+                                    }
+                                }
+                            })
+                    .create();
+        }
+    }
+
+    /**
+     * Shows OK/Cancel confirmation dialog about storage permission.
+     */
+    public static class ReadStorageConfirmationDialog extends DialogFragment {
+
+        @NonNull
+        @Override
+        public Dialog onCreateDialog(Bundle savedInstanceState) {
+            final Fragment parent = getParentFragment();
+            return new AlertDialog.Builder(getActivity())
+                    .setMessage(R.string.request_storage_permission)
+                    .setPositiveButton(android.R.string.ok, new DialogInterface.OnClickListener() {
+                        @Override
+                        public void onClick(DialogInterface dialog, int which) {
+                            parent.requestPermissions(new String[]{Manifest.permission.READ_EXTERNAL_STORAGE},
+                                    REQUEST_WRITE_STORAGE_PERMISSION);
+                        }
+                    })
+                    .setNegativeButton(android.R.string.cancel,
+                            new DialogInterface.OnClickListener() {
+                                @Override
+                                public void onClick(DialogInterface dialog, int which) {
+                                    Activity activity = parent.getActivity();
+                                    if (activity != null) {
+                                        activity.finish();
+                                    }
+                                }
+                            })
+                    .create();
+        }
+    }
 }
